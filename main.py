@@ -1,4 +1,4 @@
-"""Run metrics on restart and grid files."""
+"""Compute metrics using restart and grid files."""
 
 import argparse
 import os

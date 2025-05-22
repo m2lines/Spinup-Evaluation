@@ -1,4 +1,4 @@
-"""Dictionary to map standard variable names to different names across datasets."""
+"""Lookup table for mapping standard variables to dataset variants."""
 
 VARIABLE_ALIASES = {
     "temperature": [

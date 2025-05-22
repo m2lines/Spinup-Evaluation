@@ -3,33 +3,6 @@
 import xarray
 
 
-# def check_density(density: xarray.DataArray, epsilon: float = 1e-5):
-#     """
-#     Return the proportion of points not respecting the density decreasing constraint.
-
-#     The density should decrease with depth, so the difference between the density at
-#     a given depth and the density at the next depth should be negative.
-
-#     Parameters
-#     ----------
-#     density : xarray.DataArray
-#         DataArray (t, depth, lat, lon) with density value for each point of the
-#         grid.
-#     epsilon : float
-#         Threshold for the density difference. Default is 1e-5.
-
-#     Returns
-#     -------
-#     float
-#         Proportion of points not respecting density decreasing constraint
-#     """
-#     density = density.where(density != 0)
-#     diff = density - density.shift(depth=-1)
-#     return (
-#         (diff > epsilon).mean().data
-#     )  # Proportion of points not respecting decreasing density
-
-
 def check_density(density: xarray.DataArray, epsilon: float = 1e-5):
     """
     Return, for each time step, the proportion of grid points whose density
