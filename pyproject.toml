@@ -17,7 +17,9 @@ classifiers = [
 dependencies = ["xarray[complete]==2024.7.0", "numpy==2.0.2"]
 
 [project.optional-dependencies]
-dev = ["ruff"]
+dev = [
+  "ruff==0.11.7"
+]
 
 [project.urls]
 Repository = "https://github.com/m2lines/Spinup-Evaluation"
