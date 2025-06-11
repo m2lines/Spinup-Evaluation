@@ -4,7 +4,10 @@ import argparse
 import csv
 import os
 import sys
+import glob
 from collections import defaultdict
+import yaml
+import pandas as pd
 
 import xarray as xr
 
@@ -20,27 +23,89 @@ from src.utils import get_density, get_depth
 from variable_aliases import VARIABLE_ALIASES, standardize_variables
 
 
-def read_data(datafilepath, maskfilepath, variable_dict):
-    """Read the data and mask files and standardize variable names."""
-    filename = os.path.basename(datafilepath)
+def load_output_files(setup: dict, path: str) -> dict[str, xr.Dataset]:
+    """Load output files based on the setup configuration."""
+    output_data = {}
+    for field, filename in setup.items():
+        # TODO: check if the file exists
+        if not os.path.exists(os.path.join(path, filename)):
+            raise FileNotFoundError(f"File {filename} not found in path {path}.")
+        if field == "T_sampled":
+            # Special case for T_sampled, which is sampled from T grid
+            data_grid_T = xr.open_dataset(os.path.join(path, setup["T"]))
+            data_grid_T_sampled = xr.open_dataset(os.path.join(path, filename))
+            data_grid_T_sampled["time_counter"] = data_grid_T["time_counter"]
+            output_data[field] = data_grid_T_sampled
+        else:
+            output_data[field] = xr.open_dataset(os.path.join(path, filename))
+        # make a correction here: if field is 'T_sampled'
 
-    print(f"The provided file is: {filename}\n")
+    return output_data
 
-    # # Determine whether to decode CF conventions
-    # decode_cf = not any(
-    #     key in filename for key in ["grid_T", "grid_T_sampled", "grid_U", "grid_V"]
-    # )
 
-    # Open the dataset
-    data = xr.open_dataset(datafilepath)
+# these could be general functions for loading any mesh_mask
+# could extract the requried vars from the setup.yaml or VARIABLE_ALIASES file.
+def load_mesh_mask(path: str) -> xr.Dataset:
+    """Load the NEMO mesh mask file."""
+    ds = xr.open_dataset(path)
+    # required_vars = ["tmask", "e1t", "e2t", "e3t"]  # TODO: update with what you need
+    # missing = [var for var in required_vars if var not in ds.variables]
+    # if missing:
+    #     raise ValueError(f"Mesh mask file {path} is missing required variables: {missing}")
+    return ds
 
-    data = standardize_variables(data, variable_dict)
 
-    # Open and standardize the mesh mask
-    mesh_mask = xr.open_dataset(maskfilepath)
-    mesh_mask = standardize_variables(mesh_mask, variable_dict)
+def load_dino_outputs(
+    mode, path, setup: dict, VARIABLE_ALIASES: dict
+) -> dict[str, xr.Dataset]:
+    """Load DINO model inputs based on YAML configuration.
 
-    return data, mesh_mask
+    Parameters
+    ----------
+    config (dict)
+        Parsed YAML config containing mesh_mask, restart_files,
+    output_files, etc.
+
+    Returns
+    -------
+    dict[str, xr.Dataset]
+        Dictionary mapping source (e.g., 'mesh_mask', 'restart',
+    'output') to xarray datasets or variables.
+    """
+    data = {}
+
+    # Always required
+    # TODO: check if the mesh_mask file exists
+    if "mesh_mask" not in setup:
+        raise ValueError("Mesh mask file is required in the setup configuration.")
+    mesh_mask_path = setup["mesh_mask"]
+    data["mesh_mask"] = load_mesh_mask(os.path.join(path, mesh_mask_path))
+
+    # Optional: restart file
+    if mode in ["restart", "both"]:
+        # get the restart path using glob in path - it ends with restart.nc
+        # open a file that ends with restart.nc
+        restart_path = glob.glob(os.path.join(path, "*restart.nc"))[0]
+        data["restart"] = xr.open_dataset(restart_path)
+
+    # Optional: grid T, U, V, and sampled T
+    if mode in ["output", "both"] and "output_variables" in setup:
+        # check if output_variables is
+        setup_output = setup["output_variables"]
+        data["output"] = load_output_files(setup_output, path)
+
+    # now standardise the data
+    for key, dataset in data.items():
+        if isinstance(dataset, xr.Dataset):
+            data[key] = standardize_variables(dataset, VARIABLE_ALIASES)
+        elif isinstance(dataset, dict):  # e.g., output files
+            data[key] = {
+                k: standardize_variables(v, VARIABLE_ALIASES)
+                for k, v in dataset.items()
+            }
+
+    # print(data)
+    return data
 
 
 def apply_metrics_restart(data, mask):
@@ -64,7 +129,7 @@ def apply_metrics_restart(data, mask):
         "check_density_from_file": lambda d: check_density(d["density"][0]),
         "check_density_computed": lambda d: check_density(
             get_density(
-                d["temperature"], d["salinity"], get_depth(restart, mask), mask["tmask"]
+                d["temperature"], d["salinity"], get_depth(data, mask), mask["tmask"]
             )[0]
         ),
         "temperature_500m_30NS_metric": lambda d: temperature_500m_30NS_metric(
@@ -92,7 +157,7 @@ def apply_metrics_restart(data, mask):
     return results
 
 
-def apply_metrics_grid(
+def apply_metrics_output(
     data_grid_T, data_grid_T_sampled, data_grid_U, data_grid_V, restart, mask
 ):
     """
@@ -221,43 +286,28 @@ def write_metric_results(results, output_filepath):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Compute climate model diagnostics from a restart file and \
-        mesh_mask."
+        description="Compute climate model diagnostics from restart or output files."
     )
-
     parser.add_argument(
-        "--restart",
+        "--sim-path",
         type=str,
-        help="Path to the model restart file (e.g., restart.nc)",
+        help="Path to the NEMO simulation directory",
     )
     parser.add_argument(
-        "--grid_T",
+        "--ref-path",
         type=str,
-        help="Path to the NEMO grid_T file (e.g., _grid_T.nc)",
+        help="Path to the reference NEMO simulation directory",
     )
     parser.add_argument(
-        "--grid_T_sampled",
+        "--mode",
         type=str,
-        help="Path to save output metric values (e.g., _grid_T_sampled.nc)",
+        help="Process mode: 'output' for output files, 'restart' for restart files,\
+         'both' for both",
+        choices=["output", "restart", "both"],
+        default="both",
     )
     parser.add_argument(
-        "--grid_U",
-        type=str,
-        help="Path to the NEMO grid_U file (e.g., _grid_U.nc)",
-    )
-    parser.add_argument(
-        "--grid_V",
-        type=str,
-        help="Path to the NEMO grid_V file (e.g., _grid_V.nc)",
-    )
-    parser.add_argument(
-        "--mesh-mask",
-        type=str,
-        required=True,
-        help="Path to the NEMO mesh mask file (e.g., mesh_mask.nc)",
-    )
-    parser.add_argument(
-        "--output",
+        "--results",
         type=str,
         help="Path to save output metric values (default: metrics_results.csv)",
     )
@@ -265,54 +315,98 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Ensure at least one of the inputs is provided
-    if not args.restart and not (
-        args.grid_T and args.grid_T_sampled and args.grid_U and args.grid_V
-    ):
-        print("Error: You must give path to either restart file or grid files.")
+    if not args.sim_path and not args.ref_path:
+        print("Error: You must give a path to a directory.")
         parser.print_help()
         sys.exit(1)
 
     # Collect files paths based on arguments provided
-    data_files = []
-    if args.restart:
-        data_files.append(args.restart)
-    if args.grid_T:
-        data_files.append(args.grid_T)
-    if args.grid_T_sampled:
-        data_files.append(args.grid_T_sampled)
-    if args.grid_U:
-        data_files.append(args.grid_U)
-    if args.grid_V:
-        data_files.append(args.grid_V)
 
-    if args.restart and not args.grid_T:
-        restart, mesh_mask = read_data(args.restart, args.mesh_mask, VARIABLE_ALIASES)
-        results = apply_metrics_restart(restart, mesh_mask)
-        write_metric_results(results, "results/metrics_results_restart.csv")
-    else:
-        restart, mesh_mask = read_data(args.restart, args.mesh_mask, VARIABLE_ALIASES)
-        data_grid_T, mesh_mask = read_data(
-            args.grid_T, args.mesh_mask, VARIABLE_ALIASES
+    data_files = []
+    # Logic to collect data files based on the provided paths
+    # read in contents of yaml file DINO-sim.yaml which maps
+    # variables to grid files.
+
+    if args.sim_path:
+        # Load DINO-sim.yaml to get expected DINO files
+        yaml_file = "DINO-setup.yaml"
+        if not os.path.exists(yaml_file):
+            print(f"Error: The file {yaml_file} does not exist.")
+            sys.exit(1)
+        with open(yaml_file, "r") as file:
+            dino_setup = yaml.safe_load(file)
+        # Collect files based on the yaml mapping
+
+    data = load_dino_outputs(args.mode, args.sim_path, dino_setup, VARIABLE_ALIASES)
+
+    # If ref_sim_path is provided, load reference outputs
+    comparison = args.ref_path is not None
+
+    if comparison:
+        data_ref = load_dino_outputs(
+            args.mode, args.ref_path, dino_setup, VARIABLE_ALIASES
         )
-        data_grid_T_sampled, mesh_mask = read_data(
-            args.grid_T_sampled, args.mesh_mask, VARIABLE_ALIASES
+
+    if args.mode in ["restart", "both"]:
+        results = apply_metrics_restart(data["restart"], data["mesh_mask"])
+        if comparison:
+            ref_results = apply_metrics_restart(
+                data_ref["restart"], data_ref["mesh_mask"]
+            )
+
+    if args.mode in ["output", "both"]:
+        # For output mode, we expect grid_T, grid_T_sampled, grid_U, grid_V
+        grid_output = data["output"]
+        # use magic operator to pass to function.
+        results = apply_metrics_output(
+            grid_output["T"],
+            grid_output["T_sampled"],
+            grid_output["u"],
+            grid_output["v"],
+            data["restart"],
+            data["mesh_mask"],
         )
-        data_grid_T_sampled["time_counter"] = data_grid_T["time_counter"]
-        data_grid_U, mesh_mask = read_data(
-            args.grid_U, args.mesh_mask, VARIABLE_ALIASES
-        )
-        data_grid_V, mesh_mask = read_data(
-            args.grid_V, args.mesh_mask, VARIABLE_ALIASES
-        )
-        results = apply_metrics_grid(
-            data_grid_T,
-            data_grid_T_sampled,
-            data_grid_U,
-            data_grid_V,
-            restart,
-            mesh_mask,
-        )
-        write_metric_results(results, "results/metrics_results_grid.csv")
+
+        if comparison:
+            grid_output_ref = data_ref["output"]
+            results_ref = apply_metrics_output(
+                grid_output_ref["T"],
+                grid_output_ref["T_sampled"],
+                grid_output_ref["u"],
+                grid_output_ref["v"],
+                data_ref["restart"],
+                data_ref["mesh_mask"],
+            )
+        # write_metric_results(results, "results/metrics_results_grid.csv")
+
+        results_ref = {f"ref_{key}": value for key, value in results_ref.items()}
+
+        # compute differences between results and reference results
+        results_diff = {}
+        results_stats = {}
+        for key in results:
+            # compute MAE and RMSE using xarrays
+            results_diff[f"diff_{key}_ae"] = results[key] - results_ref[f"ref_{key}"]
+            results_stats[f"diff_{key}_mae"] = (
+                results[key].mean() - results_ref.get(f"ref_{key}", 0).mean()
+            )
+            results_stats[f"diff_{key}_rmse"] = (
+                (results[key] - results_ref.get(f"ref_{key}", 0)) ** 2
+            ).mean() ** 0.5
+
+        # now append all results together
+        results.update(results_ref)
+        results.update(results_diff)
+
+        time_array = grid_output["T"].get("time_counter", None)
+        # convert results to dataframe
+        results_df = pd.DataFrame(results)
+        # add time_counter as index if available
+        if time_array is not None:
+            results_df["timestamp"] = time_array.values
+            results_df.set_index("timestamp", inplace=True)
+
+        results_df.to_csv("results/metrics_results_grid_2.csv", index=True)
 
 
 ##################################
